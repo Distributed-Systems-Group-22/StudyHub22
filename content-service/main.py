@@ -19,7 +19,7 @@ app = FastAPI(title="StudyHub Content Service")
 
 load_dotenv(Path(__file__).resolve().with_name(".env"))
 DATABASE_URL = os.environ["STUDYHUB_DATABASE_URL"]
-UPLOAD_DIR = Path(__file__).resolve().parent / "uploads"
+UPLOAD_DIR = Path(os.getenv("STUDYHUB_UPLOAD_DIR", str(Path(__file__).resolve().parent / "uploads")))
 MAX_FILE_SIZE = 5 * 1024 * 1024
 
 class BatchAccessRequest(BaseModel):

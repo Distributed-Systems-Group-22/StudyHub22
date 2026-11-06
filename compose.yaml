@@ -1,26 +1,87 @@
+x-content: &content
+  image: studyhub22-content:local
+  build:
+    context: ./content-service
+
 services:
   db:
     image: postgres:17
     environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB:?Run setup first}
+      POSTGRES_USER: ${POSTGRES_USER:?Run setup first}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Run setup first}
     ports:
       - "127.0.0.1:5433:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   rabbitmq:
     image: rabbitmq:4-management
     hostname: rabbitmq
     environment:
-      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER}
-      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS}
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_DEFAULT_USER:?Run setup first}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_DEFAULT_PASS:?Run setup first}
     ports:
       - "127.0.0.1:5672:5672"
       - "127.0.0.1:15672:15672"
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  content-migrate:
+    <<: *content
+    command: ["python", "migrate.py"]
+    environment:
+      STUDYHUB_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  content-api:
+    <<: *content
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      STUDYHUB_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      STUDYHUB_UPLOAD_DIR: /data/uploads
+      STUDYHUB_DEV_IDENTITY: ${STUDYHUB_DEV_IDENTITY:-0}
+      STUDYHUB_PROCESSING_TOKEN: ${STUDYHUB_PROCESSING_TOKEN:?Run setup first}
+      STUDYHUB_SEARCH_TOKEN: ${STUDYHUB_SEARCH_TOKEN:?Run setup first}
+      STUDYHUB_SYNTHESIS_TOKEN: ${STUDYHUB_SYNTHESIS_TOKEN:?Run setup first}
+    volumes:
+      - ./uploads:/data/uploads
+    depends_on:
+      content-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  content-relay:
+    <<: *content
+    command: ["python", "-u", "relay.py"]
+    environment:
+      STUDYHUB_DATABASE_URL: postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+      STUDYHUB_AMQP_URL: amqp://${RABBITMQ_DEFAULT_USER}:${RABBITMQ_DEFAULT_PASS}@rabbitmq:5672/%2F
+    depends_on:
+      content-migrate:
+        condition: service_completed_successfully
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
 
 volumes:
   postgres-data:
