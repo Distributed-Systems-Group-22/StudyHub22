@@ -1,5 +1,5 @@
 x-content: &content
-  image: studyhub22-content:local
+  image: studyhub-content:local
   build:
     context: ./content-service
 
