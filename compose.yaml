@@ -3,6 +3,21 @@ x-content: &content
   build:
     context: ./content-service
 
+x-synthesis: &synthesis
+  image: studyhub-synthesis:local
+  build:
+    context: ./synthesis-service
+  environment:
+    DATABASE_URL: postgresql://${SYNTHESIS_DB_USER:-synthesis}:${SYNTHESIS_DB_PASSWORD:-synthesis_dev}@synthesis-db:5432/${SYNTHESIS_DB:-synthesis_db}
+    RABBITMQ_HOST: rabbitmq
+    RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER}
+    RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS}
+    CONTENT_SERVICE_URL: http://content-api:8000
+    STUDYHUB_SYNTHESIS_TOKEN: ${STUDYHUB_SYNTHESIS_TOKEN:-}
+    STUDYHUB_DEV_IDENTITY: ${STUDYHUB_DEV_IDENTITY:-1}
+    OLLAMA_BASE_URL: ${OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+    AI_MODEL: ${AI_MODEL:-llama3.2:1b}
+
 services:
   db:
     image: postgres:17
@@ -83,6 +98,77 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  synthesis-db:
+    image: postgres:17
+    environment:
+      POSTGRES_DB: ${SYNTHESIS_DB:-synthesis_db}
+      POSTGRES_USER: ${SYNTHESIS_DB_USER:-synthesis}
+      POSTGRES_PASSWORD: ${SYNTHESIS_DB_PASSWORD:-synthesis_dev}
+    ports:
+      - "127.0.0.1:5434:5432"
+    volumes:
+      - synthesis-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+
+  synthesis-api:
+    <<: *synthesis
+    ports:
+      - "127.0.0.1:8002:8000"
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+    volumes:
+      - ./synthesis-service/app:/app/app
+    depends_on:
+      synthesis-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).close()"]
+      interval: 10s
+      timeout: 3s
+      retries: 3
+    restart: unless-stopped
+
+  synthesis-worker:
+    <<: *synthesis
+    command: ["python", "-m", "app.messaging.consumer"]
+    volumes:
+      - ./synthesis-service/app:/app/app
+    depends_on:
+      synthesis-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  synthesis-outbox-relay:
+    <<: *synthesis
+    command: ["python", "-m", "app.messaging.outbox"]
+    volumes:
+      - ./synthesis-service/app:/app/app
+    depends_on:
+      synthesis-db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    restart: unless-stopped
+
+  synthesis-recovery:
+    <<: *synthesis
+    command: ["python", "-m", "app.messaging.recovery"]
+    volumes:
+      - ./synthesis-service/app:/app/app
+    depends_on:
+      synthesis-db:
+        condition: service_healthy
+    restart: unless-stopped
+
 volumes:
   postgres-data:
   rabbitmq-data:
+  synthesis-postgres-data:

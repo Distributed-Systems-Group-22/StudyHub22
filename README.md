@@ -25,11 +25,18 @@ The table describes the team's planned service ownership and ADR topics, not fea
 | `content-service/migrations/` | PostgreSQL schema migrations, applied in numbered order |
 | `content-service/Dockerfile` | Python 3.12 image shared by API, relay, and migration containers |
 | `content-service/.dockerignore` | Excludes local environment and data files from the build context |
+| `synthesis-service/app/main.py` | FastAPI entrypoint for multi-document synthesis jobs |
+| `synthesis-service/app/routes/` | Routes for creating summaries and checking background job status |
+| `synthesis-service/app/services/` | AI client (Ollama), job lease/recovery, and Content live access check |
+| `synthesis-service/app/messaging/` | Consumer for `synthesis.jobs` & `synthesis.document-events`, outbox relay, and recovery |
+| `synthesis-service/migrations/` | Schema migrations for synthesis jobs, outbox events, and results |
+| `synthesis-service/Dockerfile` | Python 3.12 container image for synthesis services |
 | `setup/setup-content-service.ps1`, `setup/setup-content-service.sh` | Create local configuration and fill missing service tokens |
 | `setup/start-content-service.ps1`, `setup/start-content-service.sh` | Run Compose in the background |
-| `compose.yaml` | PostgreSQL, RabbitMQ, migrations, API, and relay containers |
+| `compose.yaml` | PostgreSQL (Content & Synthesis), RabbitMQ, Content, and Synthesis service containers |
 | `.env.example` | Local configuration template |
-| `content-service/requirements.txt` | Python dependencies |
+| `content-service/requirements.txt` | Content Python dependencies |
+| `synthesis-service/requirements.txt` | Synthesis Python dependencies |
 
 Root `.env`, `uploads/`, and any local `.venv/` are excluded from Git. Compose bind-mounts `./uploads` into the API container at `/data/uploads`; this is a host directory, not a Docker named volume. No `docs/` directory or placeholder directories for the other three services remain in this checkout.
 
@@ -72,6 +79,11 @@ For subsequent starts, run `docker compose up --build -d` directly; the setup sc
 | `content-migrate` | Apply pending SQL migrations, then exit | Healthy `db` |
 | `content-api` | FastAPI on port 8000 | Successful `content-migrate` |
 | `content-relay` | Publish pending outbox events | Successful `content-migrate` and healthy `rabbitmq` |
+| `synthesis-db` | PostgreSQL 17; Synthesis database (port 5434) | None |
+| `synthesis-api` | FastAPI on port 8002 | Healthy `synthesis-db` and healthy `rabbitmq` |
+| `synthesis-worker` | Synthesis consumer (`synthesis.jobs` & `synthesis.document-events`) | Healthy `synthesis-db` and healthy `rabbitmq` |
+| `synthesis-outbox-relay` | Publish pending synthesis outbox events | Healthy `synthesis-db` and healthy `rabbitmq` |
+| `synthesis-recovery` | Reclaim expired leases and manage bounded retries | Healthy `synthesis-db` |
 
 The three Content containers use the image `studyhub-content:local`. After setup, you can use these commands directly:
 
@@ -297,17 +309,32 @@ Without external consumers, messages remain queued and no AI output, search inde
 
 These steps test the Content API and publication path, using manual requests in place of the missing downstream workers. Start the stack, confirm API availability, and obtain your local Processing and Search/Synthesis tokens from `.env`. Use a synthetic nonempty file of at most 5 MiB. The steps below are a repeatable checklist, not evidence that an AI worker processed the file.
 
-1. In `/docs`, upload a synthetic PDF with `User_Name: alice`. Expect `201` and copy the `documentId`.
+1. In `/docs` (`http://127.0.0.1:8000/docs`), upload a synthetic PDF with `User_Name: alice`. Expect `201` and copy the `documentId`.
 2. Use the same ID to fetch metadata. Expect `200` for Alice and `404` for Bob.
 3. With `DocumentAccessToken`, send the ID to the batch access route. Expect the ID and version for `User_Name: alice` and an empty list for `bob`.
 4. With `ProcessingToken`, fetch version `1` and manually report `{"status":"succeeded"}`. Expect `200` for the download and `204` for the report. Alice's metadata should now show `succeeded`. Repeat the same callback: expect `204`; send `failed` afterward: expect `409`.
 5. Delete the file as Alice. Expect `204`, then retry the worker download and batch access check. Expect `404` for the download and an empty access list. The relay should log publication of the upload and deletion events.
 6. Check `docker compose logs content-relay` and the three queues in RabbitMQ management. Publication and queued messages verify the broker path, not downstream completion. With no consumers, messages accumulate in these queues.
 
+### Synthesis Service smoke test
+
+1. Open Synthesis API docs at `http://127.0.0.1:8002/docs`.
+2. Send `POST /api/v1/summaries` with header `User_Name: alice` and body:
+   ```json
+   {
+     "document_ids": ["04a1dc78-a5d7-428a-8773-3ba9ec503c22"],
+     "instruction": "Summarize the key points"
+   }
+   ```
+   Expect `202 Accepted` and copy the `job_id`.
+3. Check status via `GET /api/v1/summaries/jobs/{job_id}` with `User_Name: alice`.
+   Once completed, it returns `status: "COMPLETED"` along with `summary_text` and `summary_status: "VALID"`.
+4. Deletion invalidation test: Delete the document in Content API (`DELETE /documents/{id}` as Alice).
+   The Content relay publishes `document.deleted` to RabbitMQ queue `synthesis.document-events`.
+   The Synthesis consumer receives the event and updates the summary's status to `INVALIDATED`.
+
 ## Current handoff scope
 
-Implemented here: containerized Content API and relay, PostgreSQL/RabbitMQ infrastructure, tracked SQL migrations, owner-only upload/read/soft-delete, version-checked internal file retrieval, processing-result callbacks, batch access checks, and upload/deletion outbox events. The root Compose file is executable for this Content stack; integration of the other services is still pending.
+Implemented here: containerized Content & Metadata Service and Synthesis Service, PostgreSQL databases (`studyhub` and `synthesis_db`), shared RabbitMQ 4 broker, transactional outboxes and relays, owner-only document upload/read/soft-delete, live permission/access check client, multi-document async summary generation with Ollama AI fallback, lease-based worker concurrency, bounded retries, and event-driven cache invalidation upon document deletion.
 
-Not implemented here: AI Processing/Search/Synthesis services or their consumers and databases, Gateway/login, frontend, document listing, replacing a document version, sharing or permission updates, calendar, physical file cleanup, Prometheus/Grafana monitoring, and automated test suites. The `version` field and version checks exist, but all uploads currently create a new document at version `1`. A document's deleted row and original file remain stored.
-
-Consumers still need their own idempotency, retries, permission/version checks, and derived-data cleanup. The repository provides the Content endpoints and events for those integrations; it does not demonstrate the full four-service workflow on its own.
+Not implemented here: AI Processing Service (single-doc transcription/embeddings) and Search & Index Service (vector retrieval), Gateway/login, frontend, and Prometheus/Grafana monitoring dashboard.

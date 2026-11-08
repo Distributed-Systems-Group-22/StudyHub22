@@ -38,3 +38,5 @@ class JobStatusResponse(BaseModel):
     status: str
     attempts: int
     error_message: str | None = None
+    summary_text: str | None = None
+    summary_status: str | None = None

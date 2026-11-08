@@ -3,7 +3,7 @@ import json
 from uuid import uuid4
 
 import psycopg
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, status, Header
 from psycopg.types.json import Jsonb
 
 from app.database import get_connection
@@ -16,8 +16,7 @@ router = APIRouter(
     tags=["Summaries"]
 )
 
-# Development only.
-# Replace with authenticated user identity later.
+# Development fallback.
 DEV_USER_ID = "dev-user-001"
 
 
@@ -26,13 +25,17 @@ DEV_USER_ID = "dev-user-001"
     response_model=SummaryJobResponse,
     status_code=status.HTTP_202_ACCEPTED
 )
-def create_summary(request: SummaryRequest):
+def create_summary(
+    request: SummaryRequest,
+    user_name: str | None = Header(default=None, alias="User_Name")
+):
 
+    user_id = user_name or DEV_USER_ID
     job_id = uuid4()
     event_id = uuid4()
 
     cache_key = generate_cache_key(
-        user_id=DEV_USER_ID,
+        user_id=user_id,
         document_ids=request.document_ids,
         instruction=request.instruction
     )
@@ -41,7 +44,7 @@ def create_summary(request: SummaryRequest):
         "event_id": str(event_id),
         "event_type": "synthesis.requested",
         "job_id": str(job_id),
-        "user_id": DEV_USER_ID,
+        "user_id": user_id,
         "document_ids": request.document_ids,
         "instruction": request.instruction,
         "cache_key": cache_key
@@ -66,7 +69,7 @@ def create_summary(request: SummaryRequest):
                     """,
                     (
                         job_id,
-                        DEV_USER_ID,
+                        user_id,
                         cache_key,
                         Jsonb(request.document_ids),
                         request.instruction,

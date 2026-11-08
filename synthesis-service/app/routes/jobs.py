@@ -3,7 +3,7 @@ from uuid import UUID
 
 import psycopg
 from psycopg.rows import dict_row
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Header
 
 from app.database import get_connection
 from app.schemas import JobStatusResponse
@@ -19,7 +19,11 @@ router = APIRouter(
     "/{job_id}",
     response_model=JobStatusResponse
 )
-def get_job_status(job_id: UUID):
+def get_job_status(
+    job_id: UUID,
+    user_name: str | None = Header(default=None, alias="User_Name")
+):
+    user_id = user_name or "dev-user-001"
 
     try:
         with get_connection() as conn:
@@ -27,15 +31,18 @@ def get_job_status(job_id: UUID):
                 cur.execute(
                     """
                     SELECT
-                        job_id,
-                        status,
-                        attempts,
-                        error_message
-                    FROM synthesis_jobs
-                    WHERE job_id = %s
-                      AND user_id = %s
+                        j.job_id,
+                        j.status,
+                        j.attempts,
+                        j.error_message,
+                        r.summary_text,
+                        r.status AS summary_status
+                    FROM synthesis_jobs j
+                    LEFT JOIN synthesis_results r ON j.job_id = r.job_id
+                    WHERE j.job_id = %s
+                      AND j.user_id = %s
                     """,
-                    (job_id, "dev-user-001")
+                    (job_id, user_id)
                 )
 
                 job = cur.fetchone()

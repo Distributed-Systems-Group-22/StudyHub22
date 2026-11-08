@@ -11,6 +11,7 @@ from app.services.job_execution import process_job
 
 
 QUEUE_NAME = "synthesis.jobs"
+DOCUMENT_EVENTS_QUEUE = "synthesis.document-events"
 
 
 def connect_rabbitmq():
@@ -73,6 +74,36 @@ def on_message(channel, method, properties, body):
         )
 
 
+def on_document_event(channel, method, properties, body):
+    try:
+        event = json.loads(body)
+        event_type = event.get("eventType") or event.get("event_type")
+
+        if event_type == "document.deleted":
+            doc_id = str(event.get("documentId") or event.get("document_id", ""))
+            if doc_id:
+                from app.database import get_connection
+                with get_connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("""
+                            UPDATE synthesis_results
+                            SET status = 'INVALIDATED'
+                            WHERE summary_id IN (
+                                SELECT summary_id FROM summary_sources WHERE document_id = %s
+                            )
+                        """, (doc_id,))
+                print(
+                    f"[Consumer] Document {doc_id} deleted -> Invalidated associated synthesis summaries.",
+                    flush=True
+                )
+
+        channel.basic_ack(delivery_tag=method.delivery_tag)
+
+    except Exception as error:
+        print(f"[Consumer] Error handling document event: {error}", flush=True)
+        channel.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+
+
 def main():
     while True:
         connection = None
@@ -85,6 +116,10 @@ def main():
                 queue=QUEUE_NAME,
                 durable=True
             )
+            channel.queue_declare(
+                queue=DOCUMENT_EVENTS_QUEUE,
+                durable=True
+            )
 
             channel.basic_qos(prefetch_count=1)
 
@@ -93,9 +128,14 @@ def main():
                 on_message_callback=on_message,
                 auto_ack=False
             )
+            channel.basic_consume(
+                queue=DOCUMENT_EVENTS_QUEUE,
+                on_message_callback=on_document_event,
+                auto_ack=False
+            )
 
             print(
-                f"Worker consuming queue: {QUEUE_NAME}",
+                f"Worker consuming queues: {QUEUE_NAME}, {DOCUMENT_EVENTS_QUEUE}",
                 flush=True
             )
 

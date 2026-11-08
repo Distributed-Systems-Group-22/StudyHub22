@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 from app.services.ai_client import generate_summary
 from app.services.mock_documents import get_documents
+from app.services.content_client import verify_document_access
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -100,6 +101,7 @@ def claim_job(job_id):
                 "job_id": job_id,
                 "claim_token": token,
                 "attempt": job["attempts"] + 1,
+                "user_id": job["user_id"],
                 "document_ids": job["document_ids"],
                 "instruction": job["instruction"],
                 "cache_key": job["cache_key"]
@@ -139,10 +141,12 @@ def complete_job(
     job,
     summary_text,
     model_version,
-    prompt_version
+    prompt_version,
+    sources=None
 ):
     """Commit result and completion atomically."""
 
+    summary_id = uuid4()
     with get_connection() as conn:
         with conn.cursor() as cur:
 
@@ -183,13 +187,26 @@ def complete_job(
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, 'VALID')
             """, (
-                uuid4(),
+                summary_id,
                 job["job_id"],
                 job["cache_key"],
                 summary_text,
                 model_version,
                 prompt_version
             ))
+
+            if sources:
+                for src in sources:
+                    doc_id = src.get("documentId") or src.get("document_id")
+                    doc_ver = src.get("documentVersion") or src.get("document_version", 1)
+                    cur.execute("""
+                        INSERT INTO summary_sources (
+                            summary_id,
+                            document_id,
+                            document_version
+                        )
+                        VALUES (%s, %s, %s)
+                    """, (summary_id, str(doc_id), doc_ver))
 
     print(
         f"Job {job['job_id']} COMPLETED",
@@ -308,24 +325,39 @@ def process_job(job_id):
             flush=True
         )
 
-        # Step 1: Get synthetic source documents.
-        # Later replaced with Search Service API.
+        # Step 1: Live permission check with Content Service (ADR Live Permission Checks)
+        user_id = job.get("user_id", "dev-user-001")
+        doc_ids = job["document_ids"]
+        verified_docs = verify_document_access(user_id=user_id, document_ids=doc_ids)
+        verified_ids = {str(d.get("documentId")) for d in verified_docs}
+
+        # If Content Service token is configured and verification fails, fail closed
+        if os.getenv("STUDYHUB_SYNTHESIS_TOKEN") and not all(str(did) in verified_ids for did in doc_ids):
+            raise PermissionError(
+                f"Access check failed: one or more documents are missing or unauthorized for user {user_id}"
+            )
+
+        # Step 2: Get synthetic source documents (or Search Service API in later phase)
         documents = get_documents(
             job["document_ids"]
         )
 
-        # Step 2: Call real Ollama AI.
+        # Step 3: Call real Ollama AI.
         result = generate_summary(
             documents=documents,
             instruction=job["instruction"]
         )
 
-        # Step 3: Save result with model metadata.
+        # Step 4: Save result with model metadata and source citations.
+        sources = verified_docs if verified_docs else [
+            {"documentId": did, "documentVersion": 1} for did in doc_ids
+        ]
         completed = complete_job(
             job=job,
             summary_text=result["summary_text"],
             model_version=result["model_version"],
-            prompt_version=result["prompt_version"]
+            prompt_version=result["prompt_version"],
+            sources=sources
         )
 
         if completed:
